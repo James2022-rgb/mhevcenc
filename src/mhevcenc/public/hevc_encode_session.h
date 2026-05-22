@@ -40,6 +40,15 @@ struct EncoderConfig final {
 
   /// H.265 level encoded into the generated SPS.
   mnexus::VideoH265Level level = mnexus::VideoH265Level::k4_1;
+
+  /// Driver-defined quality level passed through to
+  /// `VkVideoEncodeQualityLevelInfoKHR`. Valid range is
+  /// `[0, VideoEncodeH265Capabilities::encode_common::max_quality_levels - 1]`.
+  /// 0 = the fastest preset (smaller bitstream, less aggressive motion
+  /// search); higher values trade encode speed for fidelity. NVIDIA's
+  /// encoder for example tends to do considerably more accurate motion
+  /// estimation at the highest preset.
+  uint32_t quality_level = 0;
 };
 
 /// Per-picture encode output.

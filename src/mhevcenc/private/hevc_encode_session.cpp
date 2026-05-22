@@ -133,6 +133,7 @@ std::unique_ptr<HevcEncodeSession> HevcEncodeSession::Create(
   params_desc.coded_height         = config.height;
   params_desc.num_ref_frames       = 1;
   params_desc.max_num_reorder_pics = 0;
+  params_desc.quality_level        = config.quality_level;
   mnexus::VideoSessionParametersHandle const params_handle =
     device->CreateVideoSessionParametersEncodeH265(params_desc);
   if (!params_handle.IsValid()) {
