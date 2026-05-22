@@ -44,19 +44,44 @@ struct HevcEncodeSession::Impl final {
   mnexus::BufferHandle                 bitstream_buffer_handle;
   uint32_t                             bitstream_buffer_size           = 0;
   mnexus::QueueId                      encode_queue;
+
+  /// Bumped at every `SubmitPicture`. Drives GOP scheduling
+  /// (frame_idx % gop_size == 0 -> IDR) so the schedule stays correct
+  /// even when the caller hasn't yet drained the previous submission.
+  uint32_t                             submitted_count                 = 0;
+  /// Bumped at every successful `WaitAndReceive`. Reflects how many
+  /// AUs have actually landed back in caller hands. Surfaced via the
+  /// `encoded_picture_count()` accessor.
   uint32_t                             encoded_picture_count           = 0;
 
   /// Whether the DPB texture's array layers have been transitioned out
   /// of `kUndefined` into `kVideoEncodeDpb`. The transition is a one-shot
-  /// emitted by the first `EncodePicture` call; after that the layout is
+  /// emitted by the first `SubmitPicture` call; after that the layout is
   /// stable for the rest of the session.
   bool                                 dpb_layout_initialized          = false;
 
-  /// Slot index + POC of the most recent successfully encoded picture.
-  /// Used as the L0 reference for the next P-frame. `prev_setup_slot`
-  /// stays at the sentinel 0xFF until the first encode completes.
+  /// Slot index + POC of the most recent submitted picture (NOT
+  /// merely the most recent completed). Updated at `SubmitPicture`
+  /// time because the GPU encode queue executes submissions FIFO --
+  /// when we submit the next P, the prev frame's encode-queue work is
+  /// guaranteed to complete before this frame's encode reads from
+  /// `prev_setup_slot`, even if its CPU-side bytes haven't been
+  /// drained yet. `prev_setup_slot` stays at the sentinel 0xFF until
+  /// the first submission.
   uint8_t                              prev_setup_slot                 = 0xFF;
   int32_t                              prev_poc                        = 0;
+
+  /// State of the at-most-one in-flight encode submission. Set by
+  /// `SubmitPicture`, consumed by `WaitAndReceive`. The pipeline
+  /// depth is 1 because the bitstream buffer is a single non-ring
+  /// allocation; ringing it would let multiple submissions overlap.
+  struct Pending final {
+    mnexus::IntraQueueSubmissionId submission_id;
+    bool     is_idr      = false;
+    int32_t  poc         = 0;
+    uint32_t encode_index = 0;  // 1-indexed, matches `submitted_count` after increment
+  };
+  std::optional<Pending>               pending;
 
   ~Impl() {
     if (device == nullptr) return;
@@ -235,10 +260,24 @@ uint32_t HevcEncodeSession::encoded_picture_count() const {
 std::optional<EncodedFrameData> HevcEncodeSession::EncodePicture(
   mnexus::TextureHandle src_picture, uint32_t src_array_layer
 ) {
+  auto token = SubmitPicture(src_picture, src_array_layer);
+  if (!token.has_value()) return std::nullopt;
+  return WaitAndReceive(*token);
+}
+
+std::optional<HevcEncodeSession::SubmissionToken> HevcEncodeSession::SubmitPicture(
+  mnexus::TextureHandle src_picture, uint32_t src_array_layer
+) {
   Impl& s = *impl_;
+  if (s.pending.has_value()) {
+    MBASE_LOG_ERROR("HevcEncodeSession::SubmitPicture: an outstanding submission exists; call WaitAndReceive first.");
+    return std::nullopt;
+  }
 
   // GOP scheduling: every gop_size-th picture (counting from 0) is an IDR.
-  uint32_t const frame_idx = s.encoded_picture_count;
+  // Driven by submitted_count so the schedule stays correct under the
+  // async path where the caller may not have drained the previous AU.
+  uint32_t const frame_idx = s.submitted_count;
   bool     const is_idr    = (frame_idx % s.config.gop_size) == 0;
   int32_t  const poc       = is_idr ? 0 : (s.prev_poc + 1);
 
@@ -344,18 +383,48 @@ std::optional<EncodedFrameData> HevcEncodeSession::EncodePicture(
   cl->End();
 
   mnexus::IntraQueueSubmissionId const id = s.device->QueueSubmitCommandList(s.encode_queue, cl);
-  s.device->QueueWaitIdle(s.encode_queue, id);
 
-  // Bytes-written readback (drains the feedback query inline since we just
-  // QueueWaitIdle'd on the prior submission, so the result is guaranteed
-  // ready).
+  // Update prev-picture state immediately so the next SubmitPicture
+  // (which may arrive before the WaitAndReceive for this one) picks
+  // the right setup slot + POC delta. The GPU encode queue's FIFO
+  // guarantees this submission's setup write completes before the next
+  // submission's read of that DPB slot.
+  s.prev_setup_slot = setup_slot;
+  s.prev_poc        = poc;
+  ++s.submitted_count;
+  s.pending = Impl::Pending{
+    .submission_id = id,
+    .is_idr        = is_idr,
+    .poc           = poc,
+    .encode_index  = s.submitted_count,
+  };
+  return id;
+}
+
+std::optional<EncodedFrameData> HevcEncodeSession::WaitAndReceive(SubmissionToken token) {
+  Impl& s = *impl_;
+  if (!s.pending.has_value()) {
+    MBASE_LOG_ERROR("HevcEncodeSession::WaitAndReceive: no outstanding submission.");
+    return std::nullopt;
+  }
+  if (s.pending->submission_id != token) {
+    MBASE_LOG_ERROR("HevcEncodeSession::WaitAndReceive: token mismatch.");
+    return std::nullopt;
+  }
+  Impl::Pending const p = *s.pending;
+  s.pending.reset();
+
+  s.device->QueueWaitIdle(s.encode_queue, p.submission_id);
+
+  // Bytes-written readback (drains the feedback query inline since we
+  // just QueueWaitIdle'd on the submission, so the result is ready).
   uint64_t bytes_written = 0;
   if (!s.device->GetLastEncodedBytesWritten(s.video_session_handle, &bytes_written)) {
-    MBASE_LOG_ERROR("HevcEncodeSession::EncodePicture: GetLastEncodedBytesWritten failed.");
+    MBASE_LOG_ERROR("HevcEncodeSession::WaitAndReceive: GetLastEncodedBytesWritten failed.");
     return std::nullopt;
   }
   if (bytes_written == 0 || bytes_written > s.bitstream_buffer_size) {
-    MBASE_LOG_ERROR("HevcEncodeSession::EncodePicture: implausible bytes_written = {} (buffer size {}).",
+    MBASE_LOG_ERROR("HevcEncodeSession::WaitAndReceive: implausible bytes_written = {} (buffer size {}).",
       bytes_written, s.bitstream_buffer_size);
     return std::nullopt;
   }
@@ -369,15 +438,13 @@ std::optional<EncodedFrameData> HevcEncodeSession::EncodePicture(
     static_cast<uint32_t>(bytes_written)
   );
 
-  // Update prev-picture state, increment counter.
-  s.prev_setup_slot = setup_slot;
-  s.prev_poc        = poc;
+  s.encoded_picture_count = p.encode_index;
 
   EncodedFrameData result;
   result.au_bytes     = std::move(au_bytes);
-  result.is_irap      = is_idr;
-  result.poc          = poc;
-  result.encode_index = ++s.encoded_picture_count;
+  result.is_irap      = p.is_idr;
+  result.poc          = p.poc;
+  result.encode_index = p.encode_index;
   return result;
 }
 

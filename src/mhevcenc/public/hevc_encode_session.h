@@ -102,6 +102,11 @@ public:
   std::vector<uint8_t> const& vps_sps_pps_bytes() const;
 
   /// Encodes one picture from `src_picture` into a fresh Annex B AU.
+  /// Synchronous: submits the encode CL on the dedicated video encode
+  /// queue, waits for completion, reads back the bytes, returns.
+  /// Implemented as a thin wrapper over `SubmitPicture` +
+  /// `WaitAndReceive`; use those directly for the pipelined path.
+  ///
   /// Caller's responsibility:
   ///   - `src_picture` MUST have `kVideoEncodeSrc` usage and contain
   ///     uncompressed YCbCr data in the format the session was
@@ -116,6 +121,38 @@ public:
   /// `vps_sps_pps_bytes()`.
   std::optional<EncodedFrameData> EncodePicture(
     mnexus::TextureHandle src_picture, uint32_t src_array_layer);
+
+  /// Opaque token identifying one in-flight encode submission.
+  /// Currently aliases the underlying mnexus submission id.
+  using SubmissionToken = mnexus::IntraQueueSubmissionId;
+
+  /// Async first-half of `EncodePicture`: builds + submits the encode
+  /// CL on the dedicated video encode queue and returns immediately
+  /// with a token the caller will hand to `WaitAndReceive` later.
+  ///
+  /// Pipeline depth is 1: at most one submission may be in flight at
+  /// any time. Calling `SubmitPicture` again with an outstanding
+  /// submission returns `std::nullopt`; the caller must
+  /// `WaitAndReceive` the prior submission first.
+  ///
+  /// Same `src_picture` / `src_array_layer` contract as
+  /// `EncodePicture`. The texture's content MUST remain valid in
+  /// `kVideoEncodeSrc` layout until the matching `WaitAndReceive`
+  /// returns -- the caller cannot reuse the texture for the next
+  /// frame's upload before then. (To reuse, allocate a small ring
+  /// of input textures; out of scope for this lib.)
+  std::optional<SubmissionToken> SubmitPicture(
+    mnexus::TextureHandle src_picture, uint32_t src_array_layer);
+
+  /// Async second-half of `EncodePicture`: waits for `token`'s encode
+  /// submission to complete, drains the feedback query, reads the
+  /// encoded bytes out of the bitstream buffer, returns them.
+  ///
+  /// `token` MUST be the value returned by the most recent
+  /// `SubmitPicture`. Returns `std::nullopt` on token mismatch (no
+  /// pending submission, or wrong token), feedback-query failure, or
+  /// implausible byte count.
+  std::optional<EncodedFrameData> WaitAndReceive(SubmissionToken token);
 
   /// Number of pictures successfully encoded since `Create`. Equal
   /// to the `encode_index` of the most recent successful
